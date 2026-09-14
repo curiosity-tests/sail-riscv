@@ -22,6 +22,9 @@ on:
   merge_group:
 
 
+permissions:
+  contents: read
+  id-token: write
 env:
   CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 jobs:
@@ -65,11 +68,16 @@ jobs:
           dnf install -y git
 
       - name: Check out repository code
-        uses: actions/checkout@v7
+        uses: crashappsec/action-checkout@main
         with:
-          # Git history is needed for `git describe` in the build to work.
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          lfs: false
           fetch-depth: 0
-
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
       - name: Common setup
         uses: ./.github/actions/sail-setup
         with:
@@ -133,8 +141,15 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends device-tree-compiler
 
       - name: Check out repository code
-        uses: actions/checkout@v7
-
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
       - name: Common setup
         uses: ./.github/actions/sail-setup
 
@@ -179,8 +194,15 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends device-tree-compiler
 
       - name: Check out repository code
-        uses: actions/checkout@v7
-
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
       - name: Common setup
         uses: ./.github/actions/sail-setup
 
