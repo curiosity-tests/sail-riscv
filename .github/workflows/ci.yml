@@ -33,226 +33,442 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            cmake_version: "3.20.0"
-            first_party_tests: true
-          - os: ubuntu-22.04
-            cmake_version: "4.1.2"
-            first_party_tests: true
-            run_all_steps: true
-          - os: ubuntu-24.04-arm
-            cmake_version: "3.20.0"
-            first_party_tests: true
-          - os: ubuntu-24.04-arm
-            cmake_version: "4.1.2"
-            first_party_tests: true
-            clang_tidy: true
-          - os: ubuntu-latest
-            container: rockylinux:8.9.20231119
-            cmake_version: "3.20.0"
-            first_party_tests: false
-          - os: ubuntu-24.04-arm
-            container: rockylinux:8.9.20231119
-            cmake_version: "3.20.0"
-            first_party_tests: false
+        - os: ubuntu-22.04
+          cmake_version: "3.20.0"
+          first_party_tests: true
+        - os: ubuntu-22.04
+          cmake_version: "4.1.2"
+          first_party_tests: true
+          run_all_steps: true
+        - os: ubuntu-24.04-arm
+          cmake_version: "3.20.0"
+          first_party_tests: true
+        - os: ubuntu-24.04-arm
+          cmake_version: "4.1.2"
+          first_party_tests: true
+          clang_tidy: true
+        - os: ubuntu-latest
+          container: rockylinux:8.9.20231119
+          cmake_version: "3.20.0"
+          first_party_tests: false
+        - os: ubuntu-24.04-arm
+          container: rockylinux:8.9.20231119
+          cmake_version: "3.20.0"
+          first_party_tests: false
 
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
 
     steps:
-      - name: Install Git (Rocky)
+    - name: Install Git (Rocky)
         # This needs be done before the git checkout step.
-        if: startsWith(matrix.os, 'ubuntu') && job.container != null
-        run: |
-          dnf update -y --enablerepo=devel
-          dnf install -y git
+      if: startsWith(matrix.os, 'ubuntu') && job.container != null
+      run: |
+        dnf update -y --enablerepo=devel
+        dnf install -y git
 
-      - name: Check out repository code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          fetch-depth: 0
-      - name: Assert instrumentation is live
-        continue-on-error: true
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-      - name: Common setup
-        uses: ./.github/actions/sail-setup
-        with:
-          cmake-version: "${{ matrix.cmake_version }}"
-          install-clang: "true"
+    - name: Check out repository code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+        fetch-depth: 0
+    - name: Common setup
+      uses: ./.github/actions/sail-setup
+      with:
+        cmake-version: "${{ matrix.cmake_version }}"
+        install-clang: "true"
 
-      - name: Ensure pre-commit checks pass
-        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
-        if: ${{ matrix.run_all_steps}}
-        run: python3 -m pip install pre-commit && pre-commit run --all-files --show-diff-on-failure --color=always
+    - name: Ensure pre-commit checks pass
+      continue-on-error: true     # racecar: scan/report/push step, must not fail the build
+      if: ${{ matrix.run_all_steps}}
+      run: python3 -m pip install pre-commit && pre-commit run --all-files --show-diff-on-failure --color=always
 
-      - name: Build simulator and first party tests
-        run: |
-          # CLANG_VERSION is set by the sail-setup action when install-clang is enabled.
-          CLANG_FLAG=""
-          if [ -n "$CLANG_VERSION" ]; then
-            CLANG_FLAG="-DCLANG_BIN=/usr/bin/clang-$CLANG_VERSION"
+    - name: Build simulator and first party tests
+      run: |
+        # CLANG_VERSION is set by the sail-setup action when install-clang is enabled.
+        CLANG_FLAG=""
+        if [ -n "$CLANG_VERSION" ]; then
+          CLANG_FLAG="-DCLANG_BIN=/usr/bin/clang-$CLANG_VERSION"
+        fi
+        # Ninja is used because the CMake Makefile generator doesn't
+        # build top-level targets in parallel unfortunately.
+        # First party tests cannot be built in the Rocky container due to lack of a suitable toolchain.
+        cmake -S . -B build -GNinja \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DWARNINGS_AS_ERRORS=TRUE \
+          -DFIRST_PARTY_TESTS=${{ matrix.first_party_tests }} \
+          -DENABLE_RISCV_TESTS=TRUE \
+          -DENABLE_RISCV_ARCH_TESTS=TRUE \
+          -DENABLE_DAMO_TESTS=TRUE \
+          -DENABLE_RISCV_VECTOR_TESTS_V64_E64=TRUE \
+          -DENABLE_RISCV_VECTOR_TESTS_V128_E32=TRUE \
+          -DENABLE_LTO=TRUE \
+          -DENABLE_CLANG_TIDY=${{ matrix.clang_tidy }} \
+          $CLANG_FLAG
+        ninja -C build all generated_sail_riscv_docs generated_smt_rv64d generated_smt_rv32d
+
+    - name: Run tests
+      run: |
+        ctest --test-dir build --output-junit tests.xml --output-on-failure
+
+    - name: Upload test results
+      if: ${{ matrix.run_all_steps}}
+      uses: actions/upload-artifact@v7
+      with:
+        name: tests.xml
+        path: build/tests.xml
+        if-no-files-found: error
+
+    - name: Upload event payload
+      if: ${{ matrix.run_all_steps}}
+      uses: actions/upload-artifact@v7
+      with:
+        name: event.json
+        path: ${{ github.event_path }}
+
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
           fi
-          # Ninja is used because the CMake Makefile generator doesn't
-          # build top-level targets in parallel unfortunately.
-          # First party tests cannot be built in the Rocky container due to lack of a suitable toolchain.
-          cmake -S . -B build -GNinja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DWARNINGS_AS_ERRORS=TRUE \
-            -DFIRST_PARTY_TESTS=${{ matrix.first_party_tests }} \
-            -DENABLE_RISCV_TESTS=TRUE \
-            -DENABLE_RISCV_ARCH_TESTS=TRUE \
-            -DENABLE_DAMO_TESTS=TRUE \
-            -DENABLE_RISCV_VECTOR_TESTS_V64_E64=TRUE \
-            -DENABLE_RISCV_VECTOR_TESTS_V128_E32=TRUE \
-            -DENABLE_LTO=TRUE \
-            -DENABLE_CLANG_TIDY=${{ matrix.clang_tidy }} \
-            $CLANG_FLAG
-          ninja -C build all generated_sail_riscv_docs generated_smt_rv64d generated_smt_rv32d
+        done
 
-      - name: Run tests
-        run: |
-          ctest --test-dir build --output-junit tests.xml --output-on-failure
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
 
-      - name: Upload test results
-        if: ${{ matrix.run_all_steps}}
-        uses: actions/upload-artifact@v7
-        with:
-          name: tests.xml
-          path: build/tests.xml
-          if-no-files-found: error
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
 
-      - name: Upload event payload
-        if: ${{ matrix.run_all_steps}}
-        uses: actions/upload-artifact@v7
-        with:
-          name: event.json
-          path: ${{ github.event_path }}
-
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   linux:
     name: "Linux boot"
     runs-on: ubuntu-latest
     steps:
-      - name: Install packages
-        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
-        run: sudo apt-get install -y --no-install-recommends device-tree-compiler
+    - name: Install packages
+      continue-on-error: true     # racecar: scan/report/push step, must not fail the build
+      run: sudo apt-get install -y --no-install-recommends device-tree-compiler
 
-      - name: Check out repository code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        continue-on-error: true
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-      - name: Common setup
-        uses: ./.github/actions/sail-setup
+    - name: Check out repository code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Common setup
+      uses: ./.github/actions/sail-setup
 
-      - name: Build simulator
-        run: |
-          cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_LTO=TRUE
-          ninja -C build
+    - name: Build simulator
+      run: |
+        cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_LTO=TRUE
+        ninja -C build
 
-      - name: Restore cache (linux image)
-        uses: actions/cache/restore@v6
-        id: linux-cache-restore
-        with:
-          path: os-boot/build/fw_payload_linux.elf
-          key: linux-image-${{ hashFiles('os-boot/linux.url', 'os-boot/opensbi.url', 'os-boot/gcc.url', 'os-boot/Makefile') }}
+    - name: Restore cache (linux image)
+      uses: actions/cache/restore@v6
+      id: linux-cache-restore
+      with:
+        path: os-boot/build/fw_payload_linux.elf
+        key: linux-image-${{ hashFiles('os-boot/linux.url', 'os-boot/opensbi.url', 'os-boot/gcc.url', 'os-boot/Makefile') }}
 
-      - name: Build Linux image
-        if: steps.linux-cache-restore.outputs.cache-hit != 'true'
-        run: make -C os-boot linux --jobs=$(nproc)
+    - name: Build Linux image
+      if: steps.linux-cache-restore.outputs.cache-hit != 'true'
+      run: make -C os-boot linux --jobs=$(nproc)
 
-      - name: Cache Linux image
+    - name: Cache Linux image
         # Update cache only on the master branch
-        if: steps.linux-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
-        uses: actions/cache/save@v6
-        with:
-          path: os-boot/build/fw_payload_linux.elf
-          key: ${{ steps.linux-cache-restore.outputs.cache-primary-key }}
+      if: steps.linux-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v6
+      with:
+        path: os-boot/build/fw_payload_linux.elf
+        key: ${{ steps.linux-cache-restore.outputs.cache-primary-key }}
 
-      - name: Linux boot
-        run: |
-          make -C os-boot build/sail.dtb
-          # The Makefile target to boot Linux on the simulator cannot be used with caching in CI due to the dependency chain
-          ./build/c_emulator/sail_riscv_sim --show-times --inst-limit 20000000 --device-tree-blob os-boot/build/sail.dtb os-boot/build/fw_payload_linux.elf 2>&1 | tee linux-boot.log
-          grep "Initmem setup node" linux-boot.log
-          grep "Instructions:     20000000" linux-boot.log
+    - name: Linux boot
+      run: |
+        make -C os-boot build/sail.dtb
+        # The Makefile target to boot Linux on the simulator cannot be used with caching in CI due to the dependency chain
+        ./build/c_emulator/sail_riscv_sim --show-times --inst-limit 20000000 --device-tree-blob os-boot/build/sail.dtb os-boot/build/fw_payload_linux.elf 2>&1 | tee linux-boot.log
+        grep "Initmem setup node" linux-boot.log
+        grep "Instructions:     20000000" linux-boot.log
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   xvisor:
     name: "Xvisor boot"
     runs-on: ubuntu-latest
     steps:
-      - name: Install packages
-        continue-on-error: true   # racecar: scan/report/push step, must not fail the build
-        run: sudo apt-get install -y --no-install-recommends device-tree-compiler
+    - name: Install packages
+      continue-on-error: true     # racecar: scan/report/push step, must not fail the build
+      run: sudo apt-get install -y --no-install-recommends device-tree-compiler
 
-      - name: Check out repository code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        continue-on-error: true
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-      - name: Common setup
-        uses: ./.github/actions/sail-setup
+    - name: Check out repository code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Common setup
+      uses: ./.github/actions/sail-setup
 
-      - name: Build simulator
-        run: |
-          cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_LTO=TRUE
-          ninja -C build
+    - name: Build simulator
+      run: |
+        cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_LTO=TRUE
+        ninja -C build
 
-      - name: Restore cache (xvisor image)
-        uses: actions/cache/restore@v6
-        id: xvisor-cache-restore
-        with:
-          path: os-boot/build/fw_payload_xvisor.elf
-          key: xvisor-image-${{ hashFiles('os-boot/xvisor.url', 'os-boot/opensbi.url', 'os-boot/gcc.url', 'os-boot/Makefile') }}
+    - name: Restore cache (xvisor image)
+      uses: actions/cache/restore@v6
+      id: xvisor-cache-restore
+      with:
+        path: os-boot/build/fw_payload_xvisor.elf
+        key: xvisor-image-${{ hashFiles('os-boot/xvisor.url', 'os-boot/opensbi.url', 'os-boot/gcc.url', 'os-boot/Makefile') }}
 
-      - name: Build Xvisor image
-        if: steps.xvisor-cache-restore.outputs.cache-hit != 'true'
-        run: make -C os-boot xvisor --jobs=$(nproc)
+    - name: Build Xvisor image
+      if: steps.xvisor-cache-restore.outputs.cache-hit != 'true'
+      run: make -C os-boot xvisor --jobs=$(nproc)
 
-      - name: Cache Xvisor image
+    - name: Cache Xvisor image
         # Update cache only on the master branch
-        if: steps.xvisor-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
-        uses: actions/cache/save@v6
-        with:
-          path: os-boot/build/fw_payload_xvisor.elf
-          key: ${{ steps.xvisor-cache-restore.outputs.cache-primary-key }}
+      if: steps.xvisor-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v6
+      with:
+        path: os-boot/build/fw_payload_xvisor.elf
+        key: ${{ steps.xvisor-cache-restore.outputs.cache-primary-key }}
 
-      - name: Xvisor boot
-        run: |
-          make -C os-boot build/sail.dtb
-          # The Makefile target to boot Xvisor on the simulator cannot be used with caching in CI due to the dependency chain
-          ./build/c_emulator/sail_riscv_sim --show-times --inst-limit 21000000 --device-tree-blob os-boot/build/sail.dtb os-boot/build/fw_payload_xvisor.elf 2>&1 | tee xvisor-boot.log
-          grep "XVisor#" xvisor-boot.log
-          grep "Instructions:     21000000" xvisor-boot.log
+    - name: Xvisor boot
+      run: |
+        make -C os-boot build/sail.dtb
+        # The Makefile target to boot Xvisor on the simulator cannot be used with caching in CI due to the dependency chain
+        ./build/c_emulator/sail_riscv_sim --show-times --inst-limit 21000000 --device-tree-blob os-boot/build/sail.dtb os-boot/build/fw_payload_xvisor.elf 2>&1 | tee xvisor-boot.log
+        grep "XVisor#" xvisor-boot.log
+        grep "Instructions:     21000000" xvisor-boot.log
 
   # This is here so that the "Status checks that are required" Github
   # option doesn't need to list all of the matrix jobs (it doesn't seem
   # to work if you just specify the job ID of the matrix itself).
   # A skipped job is considered passing by GitHub, so this job needs to
   # always run and then checks the results of all of the jobs it depends on.
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   ci_pass:
     runs-on: ubuntu-latest
     needs: [build, linux, xvisor]
     if: "${{ always() }}"
     steps:
-      - name: exit failure
-        if: "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}"
-        run: exit 1
-      - name: exit success
-        run: exit 0
+    - name: exit failure
+      if: "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}"
+      run: exit 1
+    - name: exit success
+      run: exit 0
